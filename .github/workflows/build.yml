@@ -1,0 +1,46 @@
+name: Termux Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-termux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up JDK
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Install Docker
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker.io
+
+    - name: Install Android SDK
+      run: |
+        sudo apt-get install -y wget unzip
+        wget https://dl.google.com/android/repository/commandlinetools-linux-7302050_latest.zip
+        unzip commandlinetools-linux-7302050_latest.zip -d android-sdk
+        sudo mkdir -p /usr/lib/android-sdk/cmdline-tools
+        sudo mv android-sdk/cmdline-tools /usr/lib/android-sdk/
+        sudo apt-get install -y android-sdk
+
+    - name: Build Termux with custom package name
+      run: |
+        ./build.sh com.custom.termux
+        ls -lh output/
+
+    - name: Upload APK as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: termux-apk
+        path: output/*.apk
