@@ -20,12 +20,11 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Resolve Docker conflicts and install
+    - name: Install Docker (Moby)
       run: |
-        sudo apt-get remove -y containerd containerd.io
         sudo apt-get update && sudo apt-get upgrade -y
-        sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-
+        sudo apt-get install -y moby-cli moby-engine
+        
     - name: Install Android SDK
       run: |
         sudo apt-get install -y wget unzip
