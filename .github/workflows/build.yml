@@ -35,11 +35,12 @@ jobs:
 
     - name: Build Termux with custom package name
       run: |
-        ./build.sh com.custom.termux
+        ./build-termux.sh --name sm64.builder \
+                  --add build-essential,cmake,python,proot-distro
         ls -lh output/
 
     - name: Upload APK as artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: termux-apk
         path: output/*.apk
