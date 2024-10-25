@@ -20,10 +20,11 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Install Docker
+    - name: Resolve Docker conflicts and install
       run: |
-        sudo apt-get update
-        sudo apt-get install -y docker.io
+        sudo apt-get remove -y containerd containerd.io
+        sudo apt-get update && sudo apt-get upgrade -y
+        sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 
     - name: Install Android SDK
       run: |
@@ -32,7 +33,6 @@ jobs:
         unzip commandlinetools-linux-7302050_latest.zip -d android-sdk
         sudo mkdir -p /usr/lib/android-sdk/cmdline-tools
         sudo mv android-sdk/cmdline-tools /usr/lib/android-sdk/
-        sudo apt-get install -y android-sdk
 
     - name: Build Termux with custom package name
       run: |
