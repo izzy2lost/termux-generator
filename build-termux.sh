@@ -1,7 +1,45 @@
 #!/bin/bash
+# set -x
+# Wechsel zum Verzeichnis, in dem das Skript liegt
 
-cd "$(dirname "$0")"
+# Anzeige der Hilfe
+show_usage() {
+    echo
+    echo "Usage: build-termux.sh [options]"
+    echo
+    echo "Generate Termux application."
+    echo
+    echo "Options:"
+    echo " -h, --help                  Show this help."
+    echo " -a, --add PKG_LIST          Include additional packages in bootstrap archive."
+    echo " -n, --name APP_NAME         Specify TERMUX_APP_PACKAGE name."
+    echo " -p, --plugin PLUGIN         Specify a plugin from the plugins folder to apply during building."
+    echo " -d, --dirty                 Build without cleaning previous artifacts."
+    echo
+}
 
+portable_sed_i() {
+    if sed v </dev/null 2> /dev/null
+    then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
+apply_patches() {
+    srcdir=$(realpath "$1")
+    targetdir=$(realpath "$2")
+    local PATCHES=$(find "$srcdir" -type f | sort)
+    pushd $targetdir || exit 13
+    for patch in $PATCHES
+    do
+        patch -p1 < "$patch" || exit 9
+    done
+    popd
+}
+
+# Funktion, um den Paketnamen zu überprüfen
 check_name() {
     if [[ $TERMUX_APP_PACKAGE =~ '_' ]] || \
        [[ $TERMUX_APP_PACKAGE =~ '-' ]] || \
@@ -22,195 +60,191 @@ check_name() {
        [[ $TERMUX_APP_PACKAGE == *.as ]] || \
        [[ $TERMUX_APP_PACKAGE == *.as.* ]]
     then
-        echo "package name must not contain certain strings and must not contain underscore, dash, or possibly other characters!"
+        echo "Package name must not contain underscores, dashes, or invalid patterns!"
         exit 2
     fi
 }
 
-download() {
-    # Version originally tested
-    # PLAY_STORE_TERMUX_PACKAGES_GIT_HASH=a41fd427b94dda5724edf9e1e1f5278fc6e7453e
-    # PLAY_STORE_TERMUX_APPS_GIT_HASH=63dd74e8c5c2bbb8ee28d82e7eb0874902786849
-    # PLAY_STORE_TERMUX_PACKAGES_SHA256SUM=0e5045009ac752ed30a137ffc522090880583e8ca4c969e51db7b62809701e9c
-    # PLAY_STORE_TERMUX_APPS_SHA256SUM=760a0ebc90746d244e73dd5e635e0900d5b855f72e284837fdfb9f5e67bc498e
-
-    # wget -nc https://github.com/termux-play-store/termux-apps/archive/$PLAY_STORE_TERMUX_APPS_GIT_HASH.zip || exit 3
-    # wget -nc https://github.com/termux-play-store/termux-packages/archive/$PLAY_STORE_TERMUX_PACKAGES_GIT_HASH.zip || exit 4
-
-    # echo "$PLAY_STORE_TERMUX_PACKAGES_SHA256SUM $PLAY_STORE_TERMUX_PACKAGES_GIT_HASH.zip" | sha256sum --check --status || exit 5
-    # echo "$PLAY_STORE_TERMUX_APPS_SHA256SUM $PLAY_STORE_TERMUX_APPS_GIT_HASH.zip" | sha256sum --check --status || exit 6
-
-    wget -nc https://github.com/termux-play-store/termux-apps/archive/main.zip -O termux-apps.zip || exit 3
-    wget -nc https://github.com/termux-play-store/termux-packages/archive/main.zip -O termux-packages.zip || exit 4
-
-    unzip "*.zip" || exit 7
+clean_docker() {
+    docker container kill termux-generator-package-builder 2> /dev/null || true
+    docker container rm -f termux-generator-package-builder 2>/dev/null || true
+    docker image rm ghcr.io/termux-play-store/package-builder 2>/dev/null || true
 }
 
-patch_bootstraps() {
-    local BOOTSTRAP_PATCHES=$(find $(pwd)/bootstrap-patches/ -type f | sort)
-    pushd termux-packages-* || exit 8
-    for patch in $BOOTSTRAP_PATCHES
-    do
-        patch -p1 < "$patch" || exit 9
-    done
-    sed -i "s/TERMUX_APP_PACKAGE=\"com.termux\"/TERMUX_APP_PACKAGE=\"$TERMUX_APP_PACKAGE\"/g" scripts/properties.sh || exit 10
+clean_artifacts() {
+    rm -rf termux* 2>/dev/null
+    rm *.apk 2>/dev/null
+}
+
+# Funktion, um Repositories herunterzuladen
+download() {
+    git clone https://github.com/termux-play-store/termux-packages.git termux-packages-main || exit 3
+    git clone https://github.com/termux-play-store/termux-apps.git termux-apps-main || exit 4
+}
+
+build_plugin() {
+    pushd plugins/$TERMUX_GENERATOR_PLUGIN || exit 13
+    ./gradlew build
     popd
 }
 
-build_bootstraps() {
-    pushd termux-packages-* || exit 8
+install_plugin() {
+    mkdir -p termux-apps-main/termux-app/src/main/assets/
+    cp -rf plugins/$TERMUX_GENERATOR_PLUGIN termux-apps-main/termux-app/src/main/assets/ || exit 12
+    apply_patches plugins/$TERMUX_GENERATOR_PLUGIN/bootstrap-patches termux-packages-main
+    apply_patches plugins/$TERMUX_GENERATOR_PLUGIN/app-patches termux-apps-main
+}
 
-    if [ -z "${ADDITIONAL_PACKAGES}" ]
-    then
-        scripts/run-docker.sh scripts/generate-bootstraps.sh --build || exit 11
+# Funktion, um Bootstrap-Patches anzuwenden
+patch_bootstraps() {
+    apply_patches bootstrap-patches termux-packages-main
+    pushd termux-packages-main
+    portable_sed_i "s/TERMUX_APP_PACKAGE=\"com.termux\"/TERMUX_APP_PACKAGE=\"$TERMUX_APP_PACKAGE\"/g" scripts/properties.sh || exit 10
+    popd
+}
+
+# Funktion, um Bootstraps zu erstellen
+build_bootstraps() {
+    pushd termux-packages-main || exit 8
+
+    # currently, termux-play-store/termux-packages/scripts/generate-bootstraps.sh has an issue with cross-pollution of aarch64
+    # binaries into the x86_64 bootstrap unless two separate commands are used, like this
+    if [ -z "${ADDITIONAL_PACKAGES}" ]; then
+        scripts/run-docker.sh scripts/generate-bootstraps.sh --build --architectures aarch64 || exit 11
+        scripts/run-docker.sh scripts/generate-bootstraps.sh --build --architectures x86_64 || exit 11
     else
-        scripts/run-docker.sh scripts/generate-bootstraps.sh --build --add "${ADDITIONAL_PACKAGES}" || exit 11
+        scripts/run-docker.sh scripts/generate-bootstraps.sh --build --architectures aarch64 --add "${ADDITIONAL_PACKAGES}" || exit 11
+        scripts/run-docker.sh scripts/generate-bootstraps.sh --build --architectures x86_64 --add "${ADDITIONAL_PACKAGES}" || exit 11
     fi
 
     popd
 }
 
+# Funktion, um Bootstraps zu kopieren
 copy_bootstraps() {
-    pushd termux-apps-* || exit 8
-    mkdir -p termux-app/src/main/assets/
-    cp ../termux-packages-*/bootstrap-*.zip termux-app/src/main/assets/ || exit 12
-    popd
+    mkdir -p termux-apps-main/termux-app/src/main/assets/
+    cp termux-packages-main/bootstrap-*.zip termux-apps-main/termux-app/src/main/assets/ || exit 12
 }
 
+# Funktion, um Ordner zu migrieren
 migrate_termux_folder() {
     PARENT_DIR="$(dirname "$(dirname "$1")")"
     TERMUX_APP_PACKAGE=$2
-    DESTINATION="${PARENT_DIR}"/$(echo "$TERMUX_APP_PACKAGE" | tr . /)/
-    echo "migrate_termux_folder: renaming ${PARENT_DIR}/com/termux/ to ${DESTINATION}"
+    DESTINATION="${PARENT_DIR}/$(echo "$TERMUX_APP_PACKAGE" | tr . /)/"
+    echo "Migrating folder: renaming ${PARENT_DIR}/com/termux/ to ${DESTINATION}"
     mkdir -p "${DESTINATION}"
-    mv "${PARENT_DIR}"/com/termux/* "${DESTINATION}"
-    rm -r "${PARENT_DIR}"/com/termux/
+    mv "${PARENT_DIR}/com/termux/"* "${DESTINATION}"
+    rm -r "${PARENT_DIR}/com/termux/"
 }
-export -f migrate_termux_folder
 
+# Funktion, um die App zu patchen
 patch_app() {
-    local APP_PATCHES=$(find $(pwd)/app-patches/ -type f | sort)
-    pushd termux-apps-* || exit 13
-    for patch in $APP_PATCHES
-    do
-        patch -p1 < "$patch" || exit 9
-    done
+    apply_patches app-patches termux-apps-main
+
+    pushd termux-apps-main
 
     TERMUX_APP_PACKAGE_UNDERSCORE=$(echo "$TERMUX_APP_PACKAGE" | tr . _)
-    find . -type f -exec sed -i -e "s/>Termux</>$TERMUX_APP_PACKAGE</g" \
-                                -e "s/\"Termux\"/\"$TERMUX_APP_PACKAGE\"/g" \
-                                -e "s/com\.termux/$TERMUX_APP_PACKAGE/g" \
-                                -e "s/com_termux/$TERMUX_APP_PACKAGE_UNDERSCORE/g" {} \;
+    
+    # Nur Textdateien bearbeiten, um Fehler zu vermeiden
+    find . -type f -exec file {} + | grep "text" | cut -d: -f1 | while read -r file; do
+        portable_sed_i -e "s/>Termux</>$TERMUX_APP_PACKAGE</g" \
+                       -e "s/\"Termux\"/\"$TERMUX_APP_PACKAGE\"/g" \
+                       -e "s/com\.termux/$TERMUX_APP_PACKAGE/g" \
+                       -e "s/com_termux/$TERMUX_APP_PACKAGE_UNDERSCORE/g" "$file"
+    done
 
-    find $(pwd) -type d -name termux -exec bash -c 'migrate_termux_folder "$0" $(echo $TERMUX_APP_PACKAGE)' {} \; 2>/dev/null
+    # Vollständig macOS-kompatible Variante für Verzeichnismigration
+    find "$(pwd)" -type d -name termux | while read -r dir; do
+        migrate_termux_folder "$dir" "$TERMUX_APP_PACKAGE"
+    done
 
     popd
 }
 
+# Funktion, um die App zu bauen
 build_app() {
-    pushd termux-apps-* || exit 13
-
+    pushd termux-apps-main || exit 13
     ./gradlew assembleDebug || exit 15
-
     popd
 }
 
+# Funktion, um die APK zu kopieren
 copy_app() {
-    cp termux-apps-*/termux-app/build/outputs/apk/debug/*.apk "$TERMUX_APP_PACKAGE".apk
+    cp termux-apps-main/termux-app/build/outputs/apk/debug/*.apk "$TERMUX_APP_PACKAGE".apk
 }
 
-show_usage() {
-	echo
-	echo "Usage: build-termux.sh [options]"
-	echo
-	echo "Generate Termux application."
-	echo
-	echo "Options:"
-	echo
-	echo " -h, --help                  Show this help."
-	echo
-	echo " -a, --add PKG_LIST          Specify one or more additional packages"
-	echo "                             to include into bootstrap archive."
-	echo "                             Multiple packages should be passed as"
-	echo "                             comma-separated list."
-	echo
-	echo " -n, --name APP_NAME         Specify TERMUX_APP_PACKAGE"
-	echo "                             app package name to patch the entire"
-	echo "                             Termux source code with."
-	echo
-	echo " -d, --dirty                 Attempt building without first deleting"
-	echo "                             artifacts from previous builds."
-	echo
-}
+cd "$(dirname "$0")"
 
+export TERMUX_APP_PACKAGE="com.termux"
+
+# Argumente verarbeiten
 while (($# > 0))
 do
-	case "$1" in
-		-d|--dirty)
-			DO_NOT_CLEAN=1
+    case "$1" in
+        -d|--dirty)
+            DO_NOT_CLEAN=1
             shift 1
-			;;
-		-h|--help)
-			show_usage
-			exit 0
-			;;
-		-a|--add)
-			if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]
-            then
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -a|--add)
+            if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]; then
                 export ADDITIONAL_PACKAGES="$2"
-				shift 1
-			else
-				echo "[!] Option '--add' requires an argument."
-				show_usage
-				exit 1
-			fi
-			;;
-		-n|--name)
-			if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]
-            then
-				export TERMUX_APP_PACKAGE="$2"
-				shift 1
-			else
-				echo "[!] Option '--name' requires an argument."
-				show_usage
-				exit 1
-			fi
-			;;
-		*)
-			echo "[!] Got unknown option '$1'"
-			show_usage
-			exit 1
-			;;
-	esac
-	shift 1
+                shift 1
+            else
+                echo "[!] Option '--add' requires an argument."
+                show_usage
+                exit 1
+            fi
+            ;;
+        -n|--name)
+            if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]; then
+                export TERMUX_APP_PACKAGE="$2"
+                shift 1
+            else
+                echo "[!] Option '--name' requires an argument."
+                show_usage
+                exit 1
+            fi
+            ;;
+        -p|--plugin)
+            if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]; then
+                export TERMUX_GENERATOR_PLUGIN="$2"
+                shift 1
+            else
+                echo "[!] Option '--plugin' requires an argument."
+                show_usage
+                exit 1
+            fi
+            ;;
+        *)
+            echo "[!] Unknown option '$1'"
+            show_usage
+            exit 1
+            ;;
+    esac
+    shift 1
 done
-
-if [ ! -z "${TERMUX_APP_PACKAGE}" ]
-then
-    check_name
-fi
 
 if [ -z "${DO_NOT_CLEAN}" ]
 then
-    ./clean.sh
-fi
-
-download
-
-if [ ! -z "${TERMUX_APP_PACKAGE}" ]
-then
+    # Validierung und Ausführung
+    check_name
+    clean_docker
+    clean_artifacts
+    download
+    if [ -n "$TERMUX_GENERATOR_PLUGIN" ]
+    then
+        build_plugin
+        install_plugin
+    fi
     patch_bootstraps
-fi
-
-build_bootstraps
-
-copy_bootstraps
-
-if [ ! -z "${TERMUX_APP_PACKAGE}" ]
-then
+    build_bootstraps
+    copy_bootstraps
     patch_app
 fi
 
 build_app
-
 copy_app
